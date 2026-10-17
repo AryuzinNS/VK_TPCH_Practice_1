@@ -117,7 +117,6 @@ SELECT
 FROM silver.lakehouse.returned_items;
 
 -- GOLD: агрегировать выручку от возвращенных товаров по клиентам и сохранить 20 лучших.
-SET SESSION gold.compression_codec = 'ZSTD';
 
 CREATE TABLE gold.lakehouse.top20_returned
 WITH (format = 'PARQUET')
@@ -202,3 +201,5 @@ FROM (SELECT * FROM expected EXCEPT SELECT * FROM actual) AS d
 UNION ALL
 SELECT 'gold_minus_expected', COUNT(*)
 FROM (SELECT * FROM actual EXCEPT SELECT * FROM expected) AS d;
+
+

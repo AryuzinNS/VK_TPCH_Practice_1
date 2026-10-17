@@ -51,17 +51,20 @@ services:
       - lakekeeper
       - minio
     restart: unless-stopped
+  
   superset:
     build:
       context: ./superset
       dockerfile: Dockerfile
+    image: lakehouse-superset-trino:6.0.0
     container_name: lakehouse-superset
     ports:
       - "8088:8088"
     environment:
       SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
     volumes:
-       - ./superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./superset_config.py:/app/pythonpath/superset_config.py:ro
+      - superset-data:/app/superset_home
     depends_on:
       - trino
     restart: unless-stopped

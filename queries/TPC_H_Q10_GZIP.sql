@@ -1,15 +1,18 @@
 -- TPC-H Q10: отчет по возвращенным товарам
--- Медальонный конвейер: tpch.sf1 -> Bronze -> Silver -> Gold
--- Целевой стек: Trino 476 + Lakekeeper + MinIO; имена каталогов взяты из предоставленного архива.
--- Выполняйте операторы по порядку в DBeaver, используя одно и то же подключение к Trino (localhost:8080).
--- Приведенные ниже операторы DROP удаляют только таблицы, созданные этим скриптом Q10, поэтому его можно запускать повторно.
+-- Формат Bronze: PARQUET; кодек сжатия: ZSTD
+-- Рекомендуемый вариант: Parquet + ZSTD — хороший баланс сжатия, скорости чтения и совместимости.
+-- Trino 476 + REST-каталог Iceberg (Lakekeeper) + MinIO.
+-- Выполняйте операторы сверху вниз в DBeaver, используя одно подключение к Trino.
+-- ВАЖНО: запускайте только один профиль за раз. Скрипты пересоздают одни и те же таблицы Bronze/Silver/Gold.
+-- Для Silver и Gold сохраняются настройки PARQUET + ZSTD, поэтому профиль меняет только Bronze.
+-- SET SESSION и следующий за ним CREATE TABLE должны выполняться в одной сессии DBeaver/Trino.
 
--- 0. Создать пространства имен, если они еще не существуют.
+-- Создание схем выполняется один раз; IF NOT EXISTS позволяет запускать повторно.
 CREATE SCHEMA IF NOT EXISTS bronze.lakehouse;
 CREATE SCHEMA IF NOT EXISTS silver.lakehouse;
 CREATE SCHEMA IF NOT EXISTS gold.lakehouse;
 
--- 0.1. Необязательная пересборка: удалить только таблицы этого конвейера в порядке зависимостей.
+-- Пересборка именно этого конвейера. Удаляются только его шесть таблиц.
 DROP TABLE IF EXISTS gold.lakehouse.top20_returned;
 DROP TABLE IF EXISTS silver.lakehouse.returned_items;
 DROP TABLE IF EXISTS bronze.lakehouse.customer;
@@ -17,27 +20,39 @@ DROP TABLE IF EXISTS bronze.lakehouse.orders;
 DROP TABLE IF EXISTS bronze.lakehouse.lineitem;
 DROP TABLE IF EXISTS bronze.lakehouse.nation;
 
--- 1. BRONZE: скопировать исходные таблицы без бизнес-фильтров и преобразований.
+-- BRONZE: исходные копии. Источник — сгенерированный коннектор TPC-H sf1.
+-- На этом уровне не применяются фильтры и бизнес-преобразования.
+-- customer: задаём кодек для записи следующей таблицы; выполнить в той же сессии Trino.
+SET SESSION bronze.compression_codec = 'GZIP';
+
 CREATE TABLE bronze.lakehouse.customer
 WITH (format = 'PARQUET')
 AS SELECT * FROM tpch.sf1.customer;
+
+-- orders: задаём кодек для записи следующей таблицы; выполнить в той же сессии Trino.
+SET SESSION bronze.compression_codec = 'GZIP';
+
 
 CREATE TABLE bronze.lakehouse.orders
 WITH (format = 'PARQUET')
 AS SELECT * FROM tpch.sf1.orders;
 
+-- lineitem: задаём кодек для записи следующей таблицы; выполнить в той же сессии Trino.
+SET SESSION bronze.compression_codec = 'GZIP';
 
 CREATE TABLE bronze.lakehouse.lineitem
 WITH (format = 'PARQUET')
 AS SELECT * FROM tpch.sf1.lineitem;
+
+-- nation: задаём кодек для записи следующей таблицы; выполнить в той же сессии Trino.
+SET SESSION bronze.compression_codec = 'GZIP';
 
 CREATE TABLE bronze.lakehouse.nation
 WITH (format = 'PARQUET')
 AS SELECT * FROM tpch.sf1.nation;
 
 
-
--- 1.1. Необязательная проверка количества строк: числа строк в источнике и Bronze должны совпадать.
+-- Проверка: количество строк в Bronze должно совпадать с tpch.sf1.
 SELECT 'customer' AS table_name,
        (SELECT COUNT(*) FROM tpch.sf1.customer) AS source_rows,
        (SELECT COUNT(*) FROM bronze.lakehouse.customer) AS bronze_rows
@@ -54,8 +69,10 @@ SELECT 'nation',
        (SELECT COUNT(*) FROM tpch.sf1.nation),
        (SELECT COUNT(*) FROM bronze.lakehouse.nation);
 
--- 2. SILVER: объединить клиентов, заказы, позиции заказов и страны;
--- оставить возвращенные товары за IV квартал 1993 года, нормализовать текст и рассчитать выручку по каждой позиции.
+-- SILVER: объединить исходные таблицы, отобрать возвраты за IV квартал 1993 года, нормализовать текст
+-- и рассчитать чистую выручку по каждой возвращенной позиции.
+SET SESSION silver.compression_codec = 'GZIP';
+
 CREATE TABLE silver.lakehouse.returned_items
 WITH (format = 'PARQUET')
 AS
@@ -92,9 +109,7 @@ WHERE o.orderdate >= DATE '1993-10-01'
   AND l.extendedprice IS NOT NULL
   AND l.discount IS NOT NULL;
 
-
-
--- 2.1. Проверить фильтры и даты слоя Silver.
+-- Проверка Silver: строки только за IV квартал 1993 года и с флагом R.
 SELECT
     COUNT(*) AS silver_rows,
     MIN(orderdate) AS first_order_date,
@@ -102,8 +117,8 @@ SELECT
     COUNT_IF(returnflag <> 'R') AS rows_not_marked_returned
 FROM silver.lakehouse.returned_items;
 
--- 3. GOLD: агрегировать выручку по клиентам, сохранить запрошенные выходные столбцы
--- и записать 20 клиентов с наибольшей выручкой.
+-- GOLD: агрегировать выручку от возвращенных товаров по клиентам и сохранить 20 лучших.
+
 CREATE TABLE gold.lakehouse.top20_returned
 WITH (format = 'PARQUET')
 AS
@@ -128,7 +143,7 @@ GROUP BY
 ORDER BY revenue DESC
 LIMIT 20;
 
--- 3.1. Итоговый бизнес-отчет. При чтении данных из Gold всегда указывайте ORDER BY.
+-- Итоговый результат Q10.
 SELECT
     custkey,
     name,
@@ -142,14 +157,11 @@ FROM gold.lakehouse.top20_returned
 ORDER BY revenue DESC
 LIMIT 20;
 
--- 3.2. Проверка: должно быть возвращено 20 строк (или меньше, если подходящих записей меньше).
-select * from gold.lakehouse.top20_returned 
-
+-- Итоговое количество строк. Для TPC-H SF1 обычно возвращается 20 строк.
 SELECT COUNT(*) AS gold_customers
 FROM gold.lakehouse.top20_returned;
 
--- 4. НЕОБЯЗАТЕЛЬНАЯ проверка эквивалентности результатов.
--- В обоих направлениях различия между ожидаемыми и фактическими данными должны отсутствовать.
+-- Дополнительная проверка: ожидаемый Q10 из Bronze и Gold должны совпасть.
 WITH expected AS (
     SELECT
         c.custkey,
@@ -161,15 +173,16 @@ WITH expected AS (
         NULLIF(TRIM(c.phone), '') AS phone,
         NULLIF(TRIM(c.comment), '') AS comment
     FROM bronze.lakehouse.customer AS c
-    JOIN bronze.lakehouse.orders AS o
-        ON c.custkey = o.custkey
-    JOIN bronze.lakehouse.lineitem AS l
-        ON l.orderkey = o.orderkey
-    JOIN bronze.lakehouse.nation AS n
-        ON c.nationkey = n.nationkey
+    JOIN bronze.lakehouse.orders AS o ON c.custkey = o.custkey
+    JOIN bronze.lakehouse.lineitem AS l ON l.orderkey = o.orderkey
+    JOIN bronze.lakehouse.nation AS n ON c.nationkey = n.nationkey
     WHERE o.orderdate >= DATE '1993-10-01'
-      AND o.orderdate <  DATE '1994-01-01'
+      AND o.orderdate < DATE '1994-01-01'
       AND UPPER(TRIM(l.returnflag)) = 'R'
+      AND c.custkey IS NOT NULL
+      AND o.orderkey IS NOT NULL
+      AND l.extendedprice IS NOT NULL
+      AND l.discount IS NOT NULL
     GROUP BY
         c.custkey,
         NULLIF(TRIM(c.name), ''),
@@ -189,3 +202,5 @@ FROM (SELECT * FROM expected EXCEPT SELECT * FROM actual) AS d
 UNION ALL
 SELECT 'gold_minus_expected', COUNT(*)
 FROM (SELECT * FROM actual EXCEPT SELECT * FROM expected) AS d;
+
+
